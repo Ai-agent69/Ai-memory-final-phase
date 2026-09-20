@@ -1,0 +1,1 @@
+"""database — MongoDB persistence package."""
