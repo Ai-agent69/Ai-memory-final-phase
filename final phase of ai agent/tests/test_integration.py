@@ -1,249 +1,177 @@
-"""
-tests/test_integration.py
-──────────────────────────
-End-to-end integration tests for the complete memory pipeline.
+"""End-to-end tests for the Ollama-first memory pipeline."""
 
-Ollama and MongoDB are both mocked so tests run without external services.
-The tests verify that all components wire together correctly and that the
-correct data flows through the pipeline.
-"""
-
-import pytest
-import sys
 import os
-from unittest.mock import patch, MagicMock
+import sys
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from context_analysis import analyze_context
-from importance_analysis import analyze_importance
-from persistence_analysis import analyze_persistence
-from longterm_memory import decide_longterm, LONGTERM_THRESHOLD
+from longterm_memory import LONGTERM_THRESHOLD, decide_longterm
 from main import process_input
+from memory_evaluator import calculate_final_score, make_memory_decision
 
 
-# ---------------------------------------------------------------------------
-# Long-term memory decision tests (pure logic, no mocks needed)
-# ---------------------------------------------------------------------------
-
-class TestLongtermDecision:
-
-    def test_high_scores_pass(self):
-        result = decide_longterm(0.8, 0.85, 0.9)
-        assert result["is_longterm"] is True
-
-    def test_low_scores_fail(self):
-        result = decide_longterm(0.1, 0.2, 0.1)
-        assert result["is_longterm"] is False
-
-    def test_zero_scores_fail(self):
-        result = decide_longterm(0.0, 0.0, 0.0)
-        assert result["is_longterm"] is False
-
-    def test_all_scores_at_threshold_pass(self):
-        t = LONGTERM_THRESHOLD
-        result = decide_longterm(t, t, t)
-        assert result["is_longterm"] is True
-
-    def test_combined_score_is_weighted(self):
-        result = decide_longterm(0.6, 0.8, 0.7)
-        expected = round(0.6 * 0.30 + 0.8 * 0.40 + 0.7 * 0.30, 4)
-        assert result["combined_score"] == expected
-
-    def test_result_has_required_keys(self):
-        result = decide_longterm(0.5, 0.5, 0.5)
-        assert "is_longterm" in result
-        assert "combined_score" in result
-        assert "reason" in result
-
-    def test_one_strong_score_required(self):
-        """Three moderate scores that sum above threshold but none strong."""
-        # With equal weights: 0.45*0.30 + 0.45*0.40 + 0.45*0.30 = 0.45 < 0.5
-        result = decide_longterm(0.45, 0.45, 0.45)
-        assert result["is_longterm"] is False  # below threshold
-
-    def test_clamping_above_one(self):
-        result = decide_longterm(2.0, 2.0, 2.0)
-        assert result["combined_score"] <= 1.0
-
-    def test_clamping_below_zero(self):
-        result = decide_longterm(-1.0, -0.5, -0.2)
-        assert result["combined_score"] >= 0.0
-
-
-# ---------------------------------------------------------------------------
-# Full pipeline: process_input (mocked Ollama + MongoDB)
-# ---------------------------------------------------------------------------
-
-def _mock_ollama_response(memory_type="SEMANTIC", confidence=0.9):
-    import json
+def _analysis(
+    memory_type="SEMANTIC",
+    long_term_beneficial=True,
+    importance_score=0.9,
+    persistence_score=0.9,
+    usefulness_score=0.9,
+    reason="Useful long-term memory.",
+):
     return {
-        "message": {
-            "content": json.dumps({
-                "memory_type": memory_type,
-                "confidence": confidence,
-                "reason": f"Classified as {memory_type}.",
-            })
-        }
+        "success": True,
+        "memory_type": memory_type,
+        "long_term_beneficial": long_term_beneficial,
+        "importance_score": importance_score,
+        "persistence_score": persistence_score,
+        "usefulness_score": usefulness_score,
+        "reason": reason,
+        "model_used": "gemma4:12b",
+        "error": "",
     }
 
 
-class TestProcessInputPipeline:
+class TestFinalScoreDecision:
+    def test_formula_matches_required_weights(self):
+        score = calculate_final_score(0.95, 0.99, 0.95)
+        expected = round(0.95 * 0.35 + 0.99 * 0.35 + 0.95 * 0.30, 4)
+        assert score == expected
 
-    def test_empty_input_not_stored(self):
+    def test_threshold_default_is_point_seven(self):
+        assert LONGTERM_THRESHOLD == 0.70
+
+    def test_high_scores_pass(self):
+        result = make_memory_decision(_analysis())
+        assert result["is_longterm"] is True
+        assert result["decision"] == "LONG_TERM"
+
+    def test_low_scores_fail_even_if_beneficial_true(self):
+        analysis = _analysis(
+            memory_type="SEMANTIC",
+            long_term_beneficial=True,
+            importance_score=0.3,
+            persistence_score=0.3,
+            usefulness_score=0.3,
+        )
+        result = make_memory_decision(analysis)
+        assert result["is_longterm"] is False
+        assert result["decision"] == "TEMPORARY"
+
+    def test_boolean_false_does_not_force_discard(self):
+        analysis = _analysis(
+            memory_type="SEMANTIC",
+            long_term_beneficial=False,
+            importance_score=0.95,
+            persistence_score=0.95,
+            usefulness_score=0.95,
+        )
+        result = make_memory_decision(analysis)
+        assert result["is_longterm"] is True
+
+    def test_legacy_decide_longterm_wrapper(self):
+        result = decide_longterm(0.8, 0.8, 0.8)
+        assert result["is_longterm"] is True
+        assert result["final_score"] == result["combined_score"]
+
+
+class TestProcessInputPipeline:
+    def test_empty_input_not_analyzed_or_stored(self):
         result = process_input("")
         assert result["pipeline_complete"] is False
+        assert result["analysis_success"] is False
+        assert result["stored"] is False
 
-    def test_noise_input_not_stored(self):
-        """Greeting should fail context/importance/persistence gates."""
-        result = process_input("hello")
-        assert result.get("stored") is False or not result.get("stored", True)
-
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_semantic_statement_stored(self, mock_db_class, mock_classify):
-        """A clear factual statement should be classified as SEMANTIC and stored."""
-        mock_classify.return_value = {
-            "success": True,
-            "memory_type": "SEMANTIC",
-            "confidence": 0.92,
-            "reason": "factual statement",
-            "model_used": "gemma4:12b",
-            "error": "",
-        }
-        mock_db = MagicMock()
-        mock_db.connect.return_value = None
-        mock_db.get_relevant_memories.return_value = []
-        mock_db.insert_memory.return_value = "507f1f77bcf86cd799439011"
-        mock_db_class.return_value = mock_db
-
-        result = process_input("MongoDB is a document-oriented database used in enterprise systems.")
-        assert result["pipeline_complete"] is True
-        if result.get("longterm_decision", {}).get("is_longterm"):
-            assert result["classification"]["memory_type"] == "SEMANTIC"
-
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_episodic_statement_stored(self, mock_db_class, mock_classify):
-        mock_classify.return_value = {
-            "success": True,
-            "memory_type": "EPISODIC",
-            "confidence": 0.88,
-            "reason": "event",
-            "model_used": "gemma4:12b",
-            "error": "",
-        }
-        mock_db = MagicMock()
-        mock_db.connect.return_value = None
-        mock_db.get_relevant_memories.return_value = []
-        mock_db.insert_memory.return_value = "507f1f77bcf86cd799439012"
-        mock_db_class.return_value = mock_db
-
-        result = process_input("Yesterday our team decided to migrate the database to MongoDB.")
-        assert result["pipeline_complete"] is True
-
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_procedural_statement_stored(self, mock_db_class, mock_classify):
-        mock_classify.return_value = {
-            "success": True,
-            "memory_type": "PROCEDURAL",
-            "confidence": 0.85,
-            "reason": "procedure",
-            "model_used": "gemma4:12b",
-            "error": "",
-        }
-        mock_db = MagicMock()
-        mock_db.connect.return_value = None
-        mock_db.get_relevant_memories.return_value = []
-        mock_db.insert_memory.return_value = "507f1f77bcf86cd799439013"
-        mock_db_class.return_value = mock_db
-
-        result = process_input(
-            "First analyze the memory, then calculate scores, then classify and store it in MongoDB."
+    @patch("main.MemoryDatabase")
+    @patch("main.analyze_memory")
+    def test_semantic_long_term_stored(self, mock_analyze, mock_db_class):
+        mock_analyze.return_value = _analysis(
+            "SEMANTIC",
+            True,
+            0.95,
+            0.99,
+            0.95,
+            "Stable identity information.",
         )
-        assert result["pipeline_complete"] is True
-
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_invalid_ollama_output_handled(self, mock_db_class, mock_classify):
-        """Invalid LLM output should not crash the program."""
-        mock_classify.return_value = {
-            "success": False,
-            "memory_type": None,
-            "confidence": None,
-            "reason": "LLM returned non-JSON output.",
-            "model_used": "gemma4:12b",
-            "error": "Non-JSON response: Sorry, I cannot classify this.",
-        }
         mock_db = MagicMock()
-        mock_db.connect.return_value = None
-        mock_db.get_relevant_memories.return_value = []
+        mock_db.insert_analyzed_memory.return_value = "507f1f77bcf86cd799439011"
         mock_db_class.return_value = mock_db
 
-        # Should not raise, should return pipeline_complete=True with stored=False
-        result = process_input("MongoDB is a document-oriented database system.")
-        assert result["pipeline_complete"] is True
-        if result.get("longterm_decision", {}).get("is_longterm"):
-            assert result.get("stored") is False
+        result = process_input("My name is Sujay Das")
 
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_mongodb_unavailable_handled(self, mock_db_class, mock_classify):
-        """MongoDB connection failure should not crash the program."""
-        mock_classify.return_value = {
-            "success": True,
-            "memory_type": "SEMANTIC",
-            "confidence": 0.9,
-            "reason": "fact",
-            "model_used": "gemma4:12b",
-            "error": "",
-        }
+        assert result["pipeline_complete"] is True
+        assert result["decision"] == "LONG_TERM"
+        assert result["stored"] is True
+        assert result["mongodb_status"] == "STORED"
+        document = mock_db.insert_analyzed_memory.call_args[0][0]
+        assert document["memory_type"] == "SEMANTIC"
+        assert document["final_score"] == result["final_score"]
+
+    @patch("main.MemoryDatabase")
+    @patch("main.analyze_memory")
+    def test_temporary_memory_not_inserted(self, mock_analyze, mock_db_class):
+        mock_analyze.return_value = _analysis(
+            "OTHER",
+            False,
+            0.1,
+            0.1,
+            0.1,
+            "Temporary activity.",
+        )
+
+        result = process_input("I am currently eating food")
+
+        assert result["decision"] == "TEMPORARY"
+        assert result["stored"] is False
+        assert result["mongodb_status"] == "NOT STORED"
+        mock_db_class.assert_not_called()
+
+    @patch("main.MemoryDatabase")
+    @patch("main.analyze_memory")
+    def test_mongodb_unavailable_does_not_crash(self, mock_analyze, mock_db_class):
+        mock_analyze.return_value = _analysis("PROCEDURAL", True, 0.9, 0.9, 0.9)
         mock_db = MagicMock()
         mock_db.connect.side_effect = Exception("MongoDB not running")
         mock_db_class.return_value = mock_db
 
-        # Should not raise
-        result = process_input("MongoDB is a document-oriented database system.")
-        assert result["pipeline_complete"] is True
+        result = process_input("First activate the environment and run main.py")
 
-    @patch("memory_types.memory_type_analyzer.classify_memory")
-    @patch("memory_types.memory_type_analyzer.MemoryDatabase")
-    def test_context_aware_ambiguous_statement(self, mock_db_class, mock_classify):
-        """
-        Ambiguous statement with relevant previous memory context.
-        The system should pass previous memories to Ollama as context.
-        """
-        mock_classify.return_value = {
-            "success": True,
-            "memory_type": "PROCEDURAL",
-            "confidence": 0.80,
-            "reason": "same method refers to a procedure",
+        assert result["decision"] == "LONG_TERM"
+        assert result["stored"] is False
+        assert result["mongodb_status"] == "UNAVAILABLE"
+        assert "MongoDB not running" in result["storage_error"]
+
+    @patch("main.analyze_memory")
+    def test_ollama_error_stops_before_mongodb(self, mock_analyze):
+        mock_analyze.return_value = {
+            "success": False,
             "model_used": "gemma4:12b",
-            "error": "",
+            "error": "Connection refused",
+            "reason": "Could not communicate with Ollama.",
         }
-        mock_db = MagicMock()
-        mock_db.connect.return_value = None
-        mock_db.get_relevant_memories.return_value = [
-            {
-                "memory": "The user learned how to connect Flask to MongoDB.",
-                "memory_type": "PROCEDURAL",
-            }
-        ]
-        mock_db.insert_memory.return_value = "507f1f77bcf86cd799439014"
-        mock_db_class.return_value = mock_db
 
-        result = process_input(
-            "I want to use the same method for my new project.",
+        result = process_input("I like football")
+
+        assert result["pipeline_complete"] is False
+        assert result["analysis_success"] is False
+        assert result["stored"] is False
+        assert result["mongodb_status"] == "NOT_ATTEMPTED"
+
+    @patch("main.MemoryDatabase")
+    @patch("main.analyze_memory")
+    def test_final_score_not_ollama_boolean_controls_storage(self, mock_analyze, mock_db_class):
+        mock_analyze.return_value = _analysis(
+            "SEMANTIC",
+            True,
+            0.2,
+            0.2,
+            0.2,
+            "Beneficial signal is true but scores are low.",
         )
-        assert result["pipeline_complete"] is True
 
-    def test_all_pipeline_keys_present(self):
-        """The result dict should always have the top-level pipeline keys."""
-        result = process_input("Python is a high-level programming language.")
-        assert "input" in result
-        assert "pipeline_complete" in result
-        assert "context" in result
-        assert "importance" in result
-        assert "persistence" in result
-        assert "longterm_decision" in result
+        result = process_input("Maybe remember this tiny thing")
+
+        assert result["long_term_beneficial"] is True
+        assert result["decision"] == "TEMPORARY"
+        assert result["stored"] is False
+        mock_db_class.assert_not_called()

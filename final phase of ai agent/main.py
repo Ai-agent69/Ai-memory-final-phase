@@ -1,32 +1,33 @@
 """
 main.py
-────────
+-------
 Entry point for the Hybrid Agentic Memory System.
 
-Pipeline (per user input):
-    1. Context Analysis      — is this relevant?
-    2. Importance Analysis   — is this important?
-    3. Persistence Analysis  — will this remain useful?
-    4. Long-Term Decision    — should it be stored long-term?
-       ├── NO  → report decision, skip storage
-       └── YES → classify memory type via Ollama LLM → store in MongoDB
+Required pipeline per user input:
+    User Input
+        -> Ollama structured memory analysis JSON
+        -> Python validation
+        -> Python final score
+        -> Python threshold decision
+        -> MongoDB storage only for validated LONG_TERM memories
 
 Run:
     python main.py
 """
 
-import logging
-import os
-import sys
+from __future__ import annotations
 
-# ── Load .env file if python-dotenv is available (optional) ───────────────
+import logging
+import sys
+from typing import Any
+
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not installed — use system env vars as-is
+    pass
 
-# Configure UTF-8 encoding for Windows consoles
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -34,204 +35,232 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# ── Configure logging ─────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.WARNING,  # Show WARNING+ to keep console clean
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("main")
 
-# ── Project imports ───────────────────────────────────────────────────────
-from context_analysis import analyze_context
-from importance_analysis import analyze_importance
-from persistence_analysis import analyze_persistence
-from longterm_memory import decide_longterm
-from memory_types.memory_type_analyzer import analyze_and_store
-from ai.ollama_client import check_ollama_connection
-from database.mongodb import check_mongodb_connection
+from ai.ollama_client import analyze_memory, check_ollama_connection
+from database.mongodb import MemoryDatabase, check_mongodb_connection
+from memory_evaluator import (
+    LONG_TERM_THRESHOLD,
+    build_memory_document,
+    make_memory_decision,
+)
 
-# ---------------------------------------------------------------------------
-# Startup checks
-# ---------------------------------------------------------------------------
+
+def _yes_no(value: bool) -> str:
+    return "YES" if value else "NO"
+
 
 def _print_startup_status() -> None:
     """Print a brief status of Ollama and MongoDB connections at startup."""
-    print("\n" + "═" * 60)
-    print("  Hybrid Agentic Memory System")
-    print("═" * 60)
+    print("\n" + "=" * 60)
+    print("Hybrid Agentic Memory System")
+    print("=" * 60)
 
-    # Ollama
     ollama_status = check_ollama_connection()
     if ollama_status["connected"] and ollama_status["model_found"]:
-        print(f"  ✅ Ollama   : connected  | model: {ollama_status['model_used']}")
+        print(f"Ollama : CONNECTED | model: {ollama_status['model_used']}")
     elif ollama_status["connected"]:
-        print(f"  ⚠️  Ollama   : connected  | model '{ollama_status['model_used']}' NOT found")
-        print(f"     Available: {ollama_status['available_models']}")
+        print(f"Ollama : CONNECTED | model '{ollama_status['model_used']}' not found")
+        print(f"Available models: {ollama_status['available_models']}")
     else:
-        print(f"  ❌ Ollama   : UNAVAILABLE — {ollama_status['error']}")
+        print(f"Ollama : UNAVAILABLE | {ollama_status['error']}")
 
-    # MongoDB
     mongo_status = check_mongodb_connection()
     if mongo_status["connected"]:
-        print(f"  ✅ MongoDB  : connected  | db: {mongo_status['db_name']}")
+        print(f"MongoDB: CONNECTED | db: {mongo_status['db_name']}")
     else:
-        print(f"  ❌ MongoDB  : UNAVAILABLE — {mongo_status['error']}")
+        print(f"MongoDB: UNAVAILABLE | {mongo_status['error']}")
 
-    print("═" * 60)
-    print("  Type your statement and press Enter.")
-    print("  Type 'quit' or 'exit' to stop.")
-    print("═" * 60 + "\n")
+    print("=" * 60)
+    print("Type a statement and press Enter. Type 'quit' or 'exit' to stop.")
+    print("=" * 60 + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Per-input pipeline
-# ---------------------------------------------------------------------------
+def _store_long_term_memory(memory_text: str, analysis: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    """Store one approved memory document in MongoDB."""
+    document = build_memory_document(memory_text, analysis, decision)
+    db = MemoryDatabase()
+
+    try:
+        db.connect()
+    except Exception as exc:
+        logger.warning("MongoDB unavailable: %s", exc)
+        return {
+            "status": "UNAVAILABLE",
+            "stored": False,
+            "inserted_id": None,
+            "error": str(exc),
+            "document": document,
+        }
+
+    try:
+        inserted_id = db.insert_analyzed_memory(document)
+        return {
+            "status": "STORED",
+            "stored": True,
+            "inserted_id": inserted_id,
+            "error": "",
+            "document": document,
+        }
+    except Exception as exc:
+        logger.error("MongoDB storage failed: %s", exc)
+        return {
+            "status": "FAILED",
+            "stored": False,
+            "inserted_id": None,
+            "error": str(exc),
+            "document": document,
+        }
+    finally:
+        db.close()
+
 
 def process_input(
     user_input: str,
     recent_context: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """
-    Run the full memory pipeline on a single user input.
+    Run the Ollama-first memory pipeline on a single user input.
 
-    Parameters
-    ----------
-    user_input     : str — the raw user statement
-    recent_context : str, optional — last few lines of conversation context
-
-    Returns
-    -------
-    dict — full pipeline result containing all scores and the final decision
+    Ollama analyzes every non-empty input. Python validation, scoring, and the
+    threshold decision happen before MongoDB is touched.
     """
     text = (user_input or "").strip()
-
-    # ── Guard: empty input ────────────────────────────────────────────────
     if not text:
         return {
             "input": text,
             "pipeline_complete": False,
-            "reason": "Empty input — nothing to process.",
+            "analysis_success": False,
+            "stored": False,
+            "mongodb_status": "NOT_ATTEMPTED",
+            "reason": "Empty input - nothing to process.",
         }
 
-    result: dict = {"input": text}
+    result: dict[str, Any] = {
+        "input": text,
+        "pipeline_complete": False,
+        "analysis_success": False,
+        "stored": False,
+        "mongodb_status": "NOT_ATTEMPTED",
+    }
 
-    # ── Step 1: Context Analysis ──────────────────────────────────────────
-    ctx = analyze_context(text, recent_context)
-    result["context"] = ctx
-    context_score: float = ctx["context_score"]
+    analysis = analyze_memory(text, recent_context=recent_context)
+    result["analysis"] = analysis
 
-    # ── Step 2: Importance Analysis ───────────────────────────────────────
-    imp = analyze_importance(text)
-    result["importance"] = imp
-    importance_score: float = imp["importance_score"]
-
-    # ── Step 3: Persistence Analysis ─────────────────────────────────────
-    per = analyze_persistence(text)
-    result["persistence"] = per
-    persistence_score: float = per["persistence_score"]
-
-    # ── Step 4: Long-Term Memory Decision ─────────────────────────────────
-    lt = decide_longterm(context_score, importance_score, persistence_score)
-    result["longterm_decision"] = lt
-
-    if not lt["is_longterm"]:
-        result["pipeline_complete"] = True
-        result["stored"] = False
-        result["reason"] = "Not stored: did not pass the long-term memory threshold."
+    if not analysis["success"]:
+        result.update(
+            {
+                "pipeline_complete": False,
+                "reason": analysis.get("reason", "Memory analysis failed."),
+                "error": analysis.get("error", ""),
+            }
+        )
         return result
 
-    # ── Step 5: Memory Type Classification + MongoDB Storage ─────────────
-    classification = analyze_and_store(
-        memory=text,
-        context_score=context_score,
-        importance_score=importance_score,
-        persistence_score=persistence_score,
+    decision = make_memory_decision(analysis, threshold=LONG_TERM_THRESHOLD)
+    result.update(
+        {
+            "pipeline_complete": True,
+            "analysis_success": True,
+            "memory_type": analysis["memory_type"],
+            "long_term_beneficial": analysis["long_term_beneficial"],
+            "importance_score": analysis["importance_score"],
+            "persistence_score": analysis["persistence_score"],
+            "usefulness_score": analysis["usefulness_score"],
+            "final_score": decision["final_score"],
+            "threshold": decision["threshold"],
+            "decision": decision["decision"],
+            "reason": analysis["reason"],
+            "decision_reason": decision["reason"],
+        }
     )
-    result["classification"] = classification
-    result["pipeline_complete"] = True
-    result["stored"] = classification["success"] and classification["inserted_id"] is not None
 
-    if classification["success"]:
-        result["reason"] = (
-            f"Stored as {classification['memory_type']} memory "
-            f"(confidence: {classification['confidence']:.2f})."
+    if not decision["is_longterm"]:
+        result.update(
+            {
+                "stored": False,
+                "mongodb_status": "NOT STORED",
+                "storage_error": "",
+            }
         )
-    else:
-        result["reason"] = (
-            f"Classification failed: {classification['error']}"
-        )
+        return result
+
+    storage = _store_long_term_memory(text, analysis, decision)
+    result["storage"] = storage
+    result["stored"] = storage["stored"]
+    result["mongodb_status"] = storage["status"]
+    result["storage_error"] = storage["error"]
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Pretty-print pipeline result
-# ---------------------------------------------------------------------------
-
-def _print_result(result: dict) -> None:
-    """Display the pipeline result in a readable format."""
+def _print_result(result: dict[str, Any]) -> None:
+    """Display the memory analysis in a clear, test-friendly format."""
     print()
-    print("─" * 60)
+    print("=" * 40)
+    print("MEMORY ANALYSIS")
+    print("=" * 40)
+    print("Input:")
+    print(result.get("input", ""))
+    print()
 
-    if not result.get("pipeline_complete"):
-        print(f"  ⚠️  {result.get('reason', 'Unknown error.')}")
-        print("─" * 60)
+    if not result.get("analysis_success"):
+        print("Memory Type:")
+        print("N/A")
+        print()
+        print("Decision:")
+        print("NOT ANALYZED")
+        print()
+        print("MongoDB:")
+        print(result.get("mongodb_status", "NOT_ATTEMPTED"))
+        print()
+        print("Reason:")
+        print(result.get("reason", "Analysis failed."))
+        error = result.get("error")
+        if error:
+            print()
+            print("Error:")
+            print(error)
+        print("=" * 40)
         return
 
-    # Scores
-    ctx = result.get("context", {})
-    imp = result.get("importance", {})
-    per = result.get("persistence", {})
-    lt  = result.get("longterm_decision", {})
+    print("Memory Type:")
+    print(result["memory_type"])
+    print()
+    print("Long-Term Beneficial:")
+    print(_yes_no(result["long_term_beneficial"]))
+    print()
+    print("Importance Score:")
+    print(f"{result['importance_score']:.4f}")
+    print()
+    print("Persistence Score:")
+    print(f"{result['persistence_score']:.4f}")
+    print()
+    print("Usefulness Score:")
+    print(f"{result['usefulness_score']:.4f}")
+    print()
+    print("Final Score:")
+    print(f"{result['final_score']:.4f}")
+    print()
+    print("Threshold:")
+    print(f"{result['threshold']:.2f}")
+    print()
+    print("Decision:")
+    print(result["decision"])
+    print()
+    print("MongoDB:")
+    print(result["mongodb_status"])
+    if result.get("storage_error"):
+        print(result["storage_error"])
+    print()
+    print("Reason:")
+    print(result["reason"])
+    print("=" * 40)
 
-    print(f"  📊 Scores:")
-    print(f"     Context     : {ctx.get('context_score', 'N/A'):.4f}  "
-          f"({'✅' if ctx.get('is_relevant') else '❌'})")
-    print(f"     Importance  : {imp.get('importance_score', 'N/A'):.4f}  "
-          f"({'✅' if imp.get('is_important') else '❌'})")
-    print(f"     Persistence : {per.get('persistence_score', 'N/A'):.4f}  "
-          f"({'✅' if per.get('is_persistent') else '❌'})")
-    print(f"     Combined    : {lt.get('combined_score', 'N/A'):.4f}")
-
-    # Long-term decision
-    is_longterm = lt.get("is_longterm", False)
-    print(f"\n  🧠 Long-Term Decision : {'YES — classifying' if is_longterm else 'NO — not storing'}")
-
-    if not is_longterm:
-        print(f"     Reason: {lt.get('reason', '')}")
-        print("─" * 60)
-        return
-
-    # Classification result
-    clf = result.get("classification", {})
-    if clf.get("success"):
-        mem_type = clf.get("memory_type", "?")
-        confidence = clf.get("confidence", 0.0)
-        reason = clf.get("reason", "")
-        inserted_id = clf.get("inserted_id")
-        ctx_used = clf.get("relevant_memories_used", 0)
-
-        type_icons = {"SEMANTIC": "📚", "EPISODIC": "📅", "PROCEDURAL": "⚙️"}
-        icon = type_icons.get(mem_type, "🧩")
-
-        print(f"\n  {icon} Memory Type    : {mem_type}")
-        print(f"     Confidence   : {confidence:.4f}")
-        print(f"     Reason       : {reason}")
-        if ctx_used:
-            print(f"     Context used : {ctx_used} previous memor{'y' if ctx_used == 1 else 'ies'}")
-        if inserted_id:
-            print(f"\n  ✅ Stored in MongoDB  (id: {inserted_id})")
-        else:
-            print(f"\n  ⚠️  Classified but NOT stored (MongoDB unavailable).")
-    else:
-        print(f"\n  ❌ Classification failed: {clf.get('error', 'Unknown error')}")
-
-    print("─" * 60)
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     _print_startup_status()
@@ -242,7 +271,7 @@ def main() -> None:
         try:
             user_input = input("You: ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n\nGoodbye!")
+            print("\nGoodbye!")
             sys.exit(0)
 
         if user_input.lower() in {"quit", "exit", "q"}:
@@ -250,13 +279,11 @@ def main() -> None:
             sys.exit(0)
 
         if not user_input:
-            print("  (Empty input — please type something.)")
+            print("(Empty input - please type something.)")
             continue
 
         result = process_input(user_input, recent_context)
         _print_result(result)
-
-        # Update rolling context (last non-trivial input)
         recent_context = user_input
 
 

@@ -143,6 +143,52 @@ class TestInsertMemory:
         assert call_args["memory_type"] == "SEMANTIC"
 
 
+class TestInsertAnalyzedMemory:
+
+    def _document(self):
+        return {
+            "memory_text": "Python is a programming language.",
+            "memory_type": "SEMANTIC",
+            "long_term_beneficial": True,
+            "importance_score": 0.9,
+            "persistence_score": 0.95,
+            "usefulness_score": 0.85,
+            "final_score": 0.9025,
+            "decision": "LONG_TERM",
+            "reason": "Stable knowledge.",
+        }
+
+    def test_insert_valid_analyzed_memory(self):
+        db, col = _make_connected_db()
+        inserted_id = db.insert_analyzed_memory(self._document())
+        assert inserted_id is not None
+        document = col.insert_one.call_args[0][0]
+        assert document["memory_text"] == "Python is a programming language."
+        assert document["memory"] == document["memory_text"]
+        assert document["decision"] == "LONG_TERM"
+
+    def test_insert_rejects_temporary_decision(self):
+        db, _ = _make_connected_db()
+        document = self._document()
+        document["decision"] = "TEMPORARY"
+        with pytest.raises(ValueError, match="Only LONG_TERM"):
+            db.insert_analyzed_memory(document)
+
+    def test_insert_rejects_invalid_score(self):
+        db, _ = _make_connected_db()
+        document = self._document()
+        document["usefulness_score"] = 1.5
+        with pytest.raises(ValueError, match="usefulness_score"):
+            db.insert_analyzed_memory(document)
+
+    def test_insert_rejects_non_boolean_beneficial_flag(self):
+        db, _ = _make_connected_db()
+        document = self._document()
+        document["long_term_beneficial"] = "true"
+        with pytest.raises(ValueError, match="long_term_beneficial"):
+            db.insert_analyzed_memory(document)
+
+
 # ---------------------------------------------------------------------------
 # MemoryDatabase.get_memories_by_type
 # ---------------------------------------------------------------------------

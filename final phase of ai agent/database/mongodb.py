@@ -12,21 +12,25 @@ Responsibilities:
 Database  : agentic_memory  (configurable via MONGODB_DB env var)
 Collection: memories
 
-Document schema:
+Current document schema:
     {
-        "memory"           : str,
-        "memory_type"      : "SEMANTIC" | "EPISODIC" | "PROCEDURAL",
-        "context_score"    : float,
-        "importance_score" : float,
-        "persistence_score": float,
-        "confidence_score" : float,
-        "reason"           : str,
-        "created_at"       : str  (ISO-8601)
+        "memory_text"            : str,
+        "memory"                 : str  (legacy alias for retrieval helpers),
+        "memory_type"            : "SEMANTIC" | "EPISODIC" | "PROCEDURAL" | "OTHER",
+        "long_term_beneficial"   : bool,
+        "importance_score"       : float,
+        "persistence_score"      : float,
+        "usefulness_score"       : float,
+        "final_score"            : float,
+        "decision"               : "LONG_TERM",
+        "reason"                 : str,
+        "created_at"             : str  (ISO-8601)
     }
 
 Environment variables:
     MONGODB_URI  — connection URI (default: mongodb://localhost:27017/)
     MONGODB_DB   — database name  (default: agentic_memory)
+    MONGODB_COLLECTION — collection name (default: memories)
 """
 
 import logging
@@ -50,9 +54,9 @@ logger = logging.getLogger(__name__)
 
 MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "agentic_memory")
-COLLECTION_NAME: str = "memories"
+COLLECTION_NAME: str = os.getenv("MONGODB_COLLECTION", "memories")
 
-VALID_MEMORY_TYPES = {"SEMANTIC", "EPISODIC", "PROCEDURAL"}
+VALID_MEMORY_TYPES = {"SEMANTIC", "EPISODIC", "PROCEDURAL", "OTHER"}
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +142,11 @@ class MemoryDatabase:
             self._collection.create_index("memory_type")
             # Index on created_at for chronological retrieval
             self._collection.create_index([("created_at", DESCENDING)])
-            # Text index on memory field for relevant-memory retrieval
-            self._collection.create_index([("memory", TEXT)], name="memory_text_index")
+            # Text index for relevant-memory retrieval.
+            self._collection.create_index(
+                [("memory_text", TEXT), ("memory", TEXT)],
+                name="memory_text_index",
+            )
             logger.debug("MongoDB indexes ensured.")
         except OperationFailure as exc:
             # Non-fatal — log and continue
@@ -151,7 +158,96 @@ class MemoryDatabase:
                 "Not connected to MongoDB. Call connect() first."
             )
 
+    @staticmethod
+    def _validate_score(value: object, field_name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric, got boolean.")
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be numeric.") from exc
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"{field_name} must be between 0.0 and 1.0.")
+        return round(score, 4)
+
+    def _normalize_analysis_document(self, document: dict) -> dict:
+        """Validate and normalize a new-architecture memory document."""
+        if not isinstance(document, dict):
+            raise ValueError("Memory document must be a dict.")
+
+        memory_value = document.get("memory_text") or document.get("memory")
+        if not isinstance(memory_value, str):
+            raise ValueError("memory_text is required and must be a string.")
+        memory_text = memory_value.strip()
+        if not memory_text:
+            raise ValueError("memory_text is required.")
+
+        memory_type = (document.get("memory_type") or "").strip().upper()
+        if memory_type not in VALID_MEMORY_TYPES:
+            raise ValueError(
+                f"Invalid memory_type: {memory_type!r}. "
+                f"Must be one of {VALID_MEMORY_TYPES}."
+            )
+
+        long_term_beneficial = document.get("long_term_beneficial")
+        if not isinstance(long_term_beneficial, bool):
+            raise ValueError("long_term_beneficial must be a boolean.")
+
+        decision = (document.get("decision") or "").strip().upper()
+        if decision != "LONG_TERM":
+            raise ValueError("Only LONG_TERM memories may be inserted.")
+
+        reason = document.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string.")
+
+        normalized = dict(document)
+        normalized["memory_text"] = memory_text
+        normalized["memory"] = memory_text
+        normalized["memory_type"] = memory_type
+        normalized["long_term_beneficial"] = long_term_beneficial
+        normalized["importance_score"] = self._validate_score(
+            document.get("importance_score"), "importance_score"
+        )
+        normalized["persistence_score"] = self._validate_score(
+            document.get("persistence_score"), "persistence_score"
+        )
+        normalized["usefulness_score"] = self._validate_score(
+            document.get("usefulness_score"), "usefulness_score"
+        )
+        normalized["final_score"] = self._validate_score(
+            document.get("final_score"), "final_score"
+        )
+        normalized["decision"] = decision
+        normalized["reason"] = reason.strip()
+        normalized.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        return normalized
+
     # ── Insert ─────────────────────────────────────────────────────────────
+
+    def insert_analyzed_memory(self, document: dict) -> str:
+        """
+        Insert a validated long-term memory analysis document.
+
+        The caller should already have validated Ollama output and made the
+        Python threshold decision. This method validates again at the storage
+        boundary to avoid inserting malformed data.
+        """
+        self._require_connection()
+        normalized = self._normalize_analysis_document(document)
+
+        try:
+            result = self._collection.insert_one(normalized)
+            inserted_id = str(result.inserted_id)
+            logger.info(
+                "Memory inserted: id=%s type=%s",
+                inserted_id,
+                normalized["memory_type"],
+            )
+            return inserted_id
+        except Exception as exc:
+            logger.error("Failed to insert memory: %s", exc)
+            raise
 
     def insert_memory(
         self,
@@ -164,7 +260,7 @@ class MemoryDatabase:
         reason: str,
     ) -> str:
         """
-        Insert a new memory document.
+        Insert a new memory document using the legacy helper signature.
 
         Parameters
         ----------
@@ -185,36 +281,30 @@ class MemoryDatabase:
         ValueError   — invalid memory_type
         RuntimeError — not connected
         """
-        self._require_connection()
-
-        memory_type_upper = (memory_type or "").strip().upper()
-        if memory_type_upper not in VALID_MEMORY_TYPES:
-            raise ValueError(
-                f"Invalid memory_type: {memory_type!r}. "
-                f"Must be one of {VALID_MEMORY_TYPES}."
-            )
+        usefulness_score = self._validate_score(confidence_score, "confidence_score")
+        final_score = round(
+            self._validate_score(importance_score, "importance_score") * 0.35
+            + self._validate_score(persistence_score, "persistence_score") * 0.35
+            + usefulness_score * 0.30,
+            4,
+        )
 
         document = {
-            "memory": memory.strip(),
-            "memory_type": memory_type_upper,
+            "memory_text": memory,
+            "memory": memory,
+            "memory_type": memory_type,
+            "long_term_beneficial": True,
             "context_score": round(float(context_score), 4),
-            "importance_score": round(float(importance_score), 4),
-            "persistence_score": round(float(persistence_score), 4),
-            "confidence_score": round(float(confidence_score), 4),
-            "reason": reason.strip(),
+            "importance_score": importance_score,
+            "persistence_score": persistence_score,
+            "usefulness_score": usefulness_score,
+            "confidence_score": usefulness_score,
+            "final_score": final_score,
+            "decision": "LONG_TERM",
+            "reason": reason,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-
-        try:
-            result = self._collection.insert_one(document)
-            inserted_id = str(result.inserted_id)
-            logger.info(
-                "Memory inserted: id=%s type=%s", inserted_id, memory_type_upper
-            )
-            return inserted_id
-        except Exception as exc:
-            logger.error("Failed to insert memory: %s", exc)
-            raise
+        return self.insert_analyzed_memory(document)
 
     # ── Retrieve ───────────────────────────────────────────────────────────
 
