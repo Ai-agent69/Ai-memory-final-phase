@@ -6,9 +6,10 @@ Entry point for the Hybrid Agentic Memory System.
 Required pipeline per user input:
     User Input
         -> Ollama structured memory analysis JSON
+        -> Temporary scope goes directly to Trash
         -> Python validation
-        -> Python final score
-        -> Python threshold decision
+        -> Python final score for potential long-term memories only
+        -> Python threshold decision: LONG_TERM or TRASH
         -> MongoDB storage only for validated LONG_TERM memories
 
 Run:
@@ -48,6 +49,7 @@ from memory_evaluator import (
     build_memory_document,
     make_memory_decision,
 )
+from trash_box import record_trash
 
 
 def _yes_no(value: bool) -> str:
@@ -126,8 +128,9 @@ def process_input(
     """
     Run the Ollama-first memory pipeline on a single user input.
 
-    Ollama analyzes every non-empty input. Python validation, scoring, and the
-    threshold decision happen before MongoDB is touched.
+    Ollama analyzes every non-empty input. Temporary scope goes directly to
+    Trash. Python validation, scoring, and the threshold decision happen before
+    MongoDB is touched for potential long-term memories.
     """
     text = (user_input or "").strip()
     if not text:
@@ -161,30 +164,60 @@ def process_input(
         )
         return result
 
-    decision = make_memory_decision(analysis, threshold=LONG_TERM_THRESHOLD)
+    try:
+        decision = make_memory_decision(analysis, threshold=LONG_TERM_THRESHOLD)
+    except (KeyError, TypeError, ValueError) as exc:
+        result.update(
+            {
+                "pipeline_complete": False,
+                "reason": "Validated analysis could not be evaluated.",
+                "error": str(exc),
+            }
+        )
+        return result
+
     result.update(
         {
             "pipeline_complete": True,
             "analysis_success": True,
             "memory_type": analysis["memory_type"],
+            "memory_scope": analysis["memory_scope"],
             "long_term_beneficial": analysis["long_term_beneficial"],
-            "importance_score": analysis["importance_score"],
-            "persistence_score": analysis["persistence_score"],
-            "usefulness_score": analysis["usefulness_score"],
             "final_score": decision["final_score"],
             "threshold": decision["threshold"],
             "decision": decision["decision"],
+            "scoring_skipped": decision["scoring_skipped"],
             "reason": analysis["reason"],
             "decision_reason": decision["reason"],
         }
     )
 
+    if not decision["scoring_skipped"]:
+        result.update(
+            {
+                "importance_score": analysis["importance_score"],
+                "persistence_score": analysis["persistence_score"],
+                "usefulness_score": analysis["usefulness_score"],
+            }
+        )
+
     if not decision["is_longterm"]:
+        trash_entry = record_trash(
+            input_text=text,
+            memory_type=analysis["memory_type"],
+            memory_scope=analysis["memory_scope"],
+            reason=analysis["reason"],
+            final_score=decision["final_score"],
+            threshold=decision["threshold"],
+            scoring_skipped=decision["scoring_skipped"],
+        )
         result.update(
             {
                 "stored": False,
                 "mongodb_status": "NOT STORED",
+                "storage": "NOT STORED",
                 "storage_error": "",
+                "trash_entry": trash_entry,
             }
         )
         return result
@@ -231,9 +264,25 @@ def _print_result(result: dict[str, Any]) -> None:
     print("Memory Type:")
     print(result["memory_type"])
     print()
-    print("Long-Term Beneficial:")
-    print(_yes_no(result["long_term_beneficial"]))
+    print("Memory Scope:")
+    print(result["memory_scope"])
     print()
+
+    if result.get("scoring_skipped"):
+        print("Decision:")
+        print(result["decision"])
+        print()
+        print("Scoring:")
+        print("SKIPPED")
+        print()
+        print("Storage:")
+        print("NOT STORED")
+        print()
+        print("Reason:")
+        print(result["reason"])
+        print("=" * 40)
+        return
+
     print("Importance Score:")
     print(f"{result['importance_score']:.4f}")
     print()
@@ -252,10 +301,14 @@ def _print_result(result: dict[str, Any]) -> None:
     print("Decision:")
     print(result["decision"])
     print()
-    print("MongoDB:")
-    print(result["mongodb_status"])
-    if result.get("storage_error"):
-        print(result["storage_error"])
+    if result["decision"] == "LONG_TERM":
+        print("MongoDB:")
+        print(result["mongodb_status"])
+        if result.get("storage_error"):
+            print(result["storage_error"])
+    else:
+        print("Storage:")
+        print("NOT STORED")
     print()
     print("Reason:")
     print(result["reason"])

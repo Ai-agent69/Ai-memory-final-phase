@@ -5,10 +5,10 @@ Ollama integration for structured memory analysis.
 
 The main memory pipeline asks Ollama to analyze every non-empty user input and
 return JSON with:
-    memory_type, long_term_beneficial, importance_score, persistence_score,
-    usefulness_score, reason
+    memory_type, memory_scope, long_term_beneficial, reason
 
-Python validates that JSON before any scoring or MongoDB storage happens.
+Only POTENTIAL_LONG_TERM responses may include scoring fields. Python validates
+that JSON before any final-score calculation or MongoDB storage happens.
 """
 
 from __future__ import annotations
@@ -23,24 +23,29 @@ import ollama
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma4:12b")
+OLLAMA_MODEL: str = "llama3.2"
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 VALID_MEMORY_TYPES = {"SEMANTIC", "EPISODIC", "PROCEDURAL", "OTHER"}
-REQUIRED_ANALYSIS_FIELDS = {
+VALID_MEMORY_SCOPES = {"TEMPORARY", "POTENTIAL_LONG_TERM"}
+REQUIRED_ROUTING_FIELDS = {
     "memory_type",
+    "memory_scope",
     "long_term_beneficial",
+    "reason",
+}
+REQUIRED_SCORE_FIELDS = {
     "importance_score",
     "persistence_score",
     "usefulness_score",
-    "reason",
 }
 
 SYSTEM_MEMORY_ANALYSIS_PROMPT = """\
 You are the memory analyzer for a Hybrid Agentic Memory System.
 
-Analyze the meaning of the user's statement. Do not use keyword matching.
-Decide based on semantic understanding and context.
+Analyze every user statement using semantic understanding. Do not use keyword
+matching or memorized example phrases. The first decision is whether the
+statement is TEMPORARY or a POTENTIAL_LONG_TERM memory candidate.
 
 Memory means information that may help future conversations with this user.
 
@@ -54,18 +59,36 @@ Memory types:
 - OTHER: questions, commands, temporary remarks, ambiguous text, or statements
   that do not clearly fit the other types.
 
-Assess whether the information is beneficial for long-term memory. This is an
-analytical signal only; Python will make the final storage decision.
+Memory scopes:
+- TEMPORARY: only relevant to the current moment/session and unlikely to be
+  useful in future conversations. Current activities, transient status updates,
+  general questions, and non-memory chat belong here.
+- POTENTIAL_LONG_TERM: stable facts, preferences, reusable procedures,
+  meaningful episodes, durable user context, or ongoing projects that may help
+  future conversations.
 
-Scores must be numbers from 0.0 to 1.0:
+If memory_scope is TEMPORARY, return only:
+{
+  "memory_type": "OTHER",
+  "memory_scope": "TEMPORARY",
+  "long_term_beneficial": false,
+  "reason": "Brief reason."
+}
+
+If memory_scope is POTENTIAL_LONG_TERM, include all three scores. Scores must be
+numbers from 0.0 to 1.0:
 - importance_score: how valuable the information itself is.
 - persistence_score: how stable or durable the information is likely to be.
 - usefulness_score: how useful it is likely to be in future conversations.
 
-Return JSON only. Do not include markdown, comments, or extra fields.
-Required JSON shape:
+Python will calculate final_score and make the final storage decision. Do not
+return final_score.
+
+Return JSON only. Do not include markdown, comments, or extra fields. Potential
+long-term JSON shape:
 {
   "memory_type": "SEMANTIC",
+  "memory_scope": "POTENTIAL_LONG_TERM",
   "long_term_beneficial": true,
   "importance_score": 0.95,
   "persistence_score": 0.99,
@@ -156,7 +179,7 @@ def validate_memory_analysis(data: dict[str, Any]) -> tuple[dict[str, Any] | Non
     if not isinstance(data, dict):
         return None, "Response is not a JSON object."
 
-    missing = sorted(REQUIRED_ANALYSIS_FIELDS - set(data))
+    missing = sorted(REQUIRED_ROUTING_FIELDS - set(data))
     if missing:
         return None, f"Missing required field(s): {', '.join(missing)}."
 
@@ -170,25 +193,43 @@ def validate_memory_analysis(data: dict[str, Any]) -> tuple[dict[str, Any] | Non
             f"got {memory_type!r}."
         )
 
+    memory_scope = data.get("memory_scope")
+    if not isinstance(memory_scope, str) or not memory_scope.strip():
+        return None, "'memory_scope' is missing or not a string."
+    memory_scope = memory_scope.strip().upper()
+    if memory_scope not in VALID_MEMORY_SCOPES:
+        return None, (
+            f"'memory_scope' must be one of {sorted(VALID_MEMORY_SCOPES)}, "
+            f"got {memory_scope!r}."
+        )
+
     long_term_beneficial = data.get("long_term_beneficial")
     if not isinstance(long_term_beneficial, bool):
         return None, "'long_term_beneficial' must be a boolean."
 
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None, "'reason' must be a non-empty string."
+
     normalized: dict[str, Any] = {
         "memory_type": memory_type,
+        "memory_scope": memory_scope,
         "long_term_beneficial": long_term_beneficial,
+        "reason": reason.strip(),
     }
+
+    if memory_scope == "TEMPORARY":
+        return normalized, ""
+
+    missing_scores = sorted(REQUIRED_SCORE_FIELDS - set(data))
+    if missing_scores:
+        return None, f"Missing required score field(s): {', '.join(missing_scores)}."
 
     for field_name in ("importance_score", "persistence_score", "usefulness_score"):
         score, error = _coerce_score(data.get(field_name), field_name)
         if error:
             return None, error
         normalized[field_name] = score
-
-    reason = data.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        return None, "'reason' must be a non-empty string."
-    normalized["reason"] = reason.strip()
 
     return normalized, ""
 
@@ -230,13 +271,13 @@ def _chat_json(messages: list[dict[str, str]]) -> Any:
             model=OLLAMA_MODEL,
             messages=messages,
             format="json",
-            options={"temperature": 0.1},
+            options={"temperature": 0.0, "num_predict": 220},
         )
     except TypeError:
         return client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
-            options={"temperature": 0.1},
+            options={"temperature": 0.0, "num_predict": 220},
         )
 
 
@@ -325,14 +366,17 @@ def classify_memory(
             "error": analysis.get("error", ""),
         }
 
-    confidence = round(
-        (
-            analysis["importance_score"]
-            + analysis["persistence_score"]
-            + analysis["usefulness_score"]
-        ) / 3,
-        4,
-    )
+    if analysis["memory_scope"] == "POTENTIAL_LONG_TERM":
+        confidence = round(
+            (
+                analysis["importance_score"]
+                + analysis["persistence_score"]
+                + analysis["usefulness_score"]
+            ) / 3,
+            4,
+        )
+    else:
+        confidence = 0.0
     return {
         "success": True,
         "memory_type": analysis["memory_type"],
